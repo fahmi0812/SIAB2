@@ -1,0 +1,523 @@
+import { useEffect, useState } from 'react';
+import { API_ERROR_CODES } from '@schoolhub/shared';
+import { AlertTriangle, ArrowRight, BarChart3, Check, CheckSquare, Clock, Download, MapPin, Save, Users, X, Activity, DoorOpen, CheckCircle2 } from 'lucide-react';
+import { apiDownload, apiFetch, formatDateTime, go, itemsOf, monthNow, qs, setNavigationGuard, today } from '../../api';
+import { riskConfirm } from '../../confirm';
+import { BrowserGeoError, captureBrowserGeolocation } from '../../geolocation';
+import { useRemote } from '../../hooks';
+import { Avatar, Btn, Card, DataTable, EmptyState, ErrorState, Field, HorizontalBarList, LoadingState, PageHead, Pill, RosterProgress, RoleTaskPanel, SelectInput, SimpleHelpBox, StackedBar, StatCardPremium, StatusDonut, StatusPill, StepGuide, TextInput, statusLabel } from '../../ui';
+import { MyAttendancePage } from '../siswa/MyAttendancePage.jsx';
+
+const STATUS = ['HADIR', 'TELAT', 'IZIN', 'SAKIT', 'ALPA'];
+const EMPTY_JOURNAL = { id: '', learningObjective: '', activity: '', lessonHours: '', completionStatus: 'BELUM_TUNTAS', updatedAt: '' };
+
+function countByStatus(rows) {
+  return itemsOf(rows).reduce((acc, row) => {
+    const status = row.status || row.attendanceStatus || row.presenceStatus || 'LAINNYA';
+    acc[status] = (acc[status] || 0) + 1;
+    return acc;
+  }, {});
+}
+
+function sessionSegments(rows) {
+  const counts = countByStatus(rows);
+  return [
+    { label: 'Berjalan', value: counts.OPEN || 0, tone: 'ok' },
+    { label: 'Terjadwal', value: counts.SCHEDULED || 0, tone: 'warn' },
+    { label: 'Selesai', value: counts.CLOSED || 0, tone: 'info' },
+    { label: 'Terlewat', value: counts.MISSED || 0, tone: 'bad' }
+  ];
+}
+
+function GenericTableState({ state }) {
+  if (state.loading) return <LoadingState />;
+  if (state.error) return <ErrorState error={state.error} onRetry={state.refresh} />;
+  const rows = itemsOf(state.data);
+  if (!rows.length) return <EmptyState title="Belum ada data" sub="Data akan muncul setelah tersedia." />;
+  const keys = Array.from(new Set(rows.flatMap((r) => Object.keys(r).filter((k) => !['id'].includes(k))))).slice(0, 8);
+  return <DataTable rows={rows} columns={keys.map((key) => ({ header: key, render: (r) => typeof r[key] === 'object' ? JSON.stringify(r[key]) : String(r[key] ?? '—') }))} />;
+}
+
+function scanWarningLabels(eligibility) {
+  const reasons = Array.isArray(eligibility?.reasons) ? eligibility.reasons : [];
+  const labels = new Set();
+  for (const reason of reasons) {
+    const text = String(reason || '').toLowerCase();
+    if (!text || text.includes('diizinkan manual')) continue;
+    if (text.includes('gerbang') && (text.includes('pulang') || text.includes('keluar'))) labels.add('Belum scan pulang');
+    else if (text.includes('gerbang') || text.includes('datang') || text.includes('masuk')) labels.add('Belum scan datang');
+    else if (text.includes('sholat') || text.includes('salat') || text.includes('dhuha') || text.includes('dzuhur') || text.includes('ashar')) labels.add('Belum scan sholat');
+    else labels.add('Perlu verifikasi');
+  }
+  return Array.from(labels);
+}
+
+const ATTENDANCE_FRIENDLY = {
+  date: 'Tanggal',
+  startsAt: 'Waktu Mulai',
+  endsAt: 'Jam Selesai',
+  status: 'Status',
+  attendanceStatus: 'Status',
+  presenceStatus: 'Status',
+  subjectName: 'Mata Pelajaran',
+  classCode: 'Kelas',
+  note: 'Keterangan',
+  reason: 'Alasan',
+  checkInAt: 'Absen Masuk',
+  checkOutAt: 'Absen Keluar',
+};
+
+function AttendanceTableState({ state }) {
+  if (state.loading) return <LoadingState />;
+  if (state.error) return <ErrorState error={state.error} onRetry={state.refresh} />;
+  const rows = itemsOf(state.data);
+  if (!rows.length) return <EmptyState title="Belum ada data kehadiran" sub="Data akan muncul setelah sesi berjalan dan dicatat." />;
+  const STATUS_KEYS = new Set(['status', 'attendanceStatus', 'presenceStatus']);
+  const DATE_KEYS = new Set(['startsAt', 'endsAt', 'date', 'checkInAt', 'checkOutAt', 'at']);
+  const keys = Array.from(new Set(rows.flatMap((r) => Object.keys(r).filter((k) => !['id'].includes(k) && ATTENDANCE_FRIENDLY[k])))).slice(0, 7);
+  if (!keys.length) {
+    const allKeys = Array.from(new Set(rows.flatMap((r) => Object.keys(r).filter((k) => !['id'].includes(k))))).slice(0, 6);
+    return <DataTable rows={rows} columns={allKeys.map((key) => ({ header: key, render: (r) => typeof r[key] === 'object' ? JSON.stringify(r[key]) : String(r[key] ?? '—') }))} />;
+  }
+  return <DataTable rows={rows} columns={keys.map((key) => ({
+    header: ATTENDANCE_FRIENDLY[key] || key,
+    render: (r) => {
+      const val = r[key];
+      if (STATUS_KEYS.has(key) && val) return <StatusPill status={val} />;
+      if (DATE_KEYS.has(key) && val) return formatDateTime(val);
+      if (typeof val === 'object' && val !== null) return JSON.stringify(val);
+      return val !== undefined && val !== null ? String(val) : '—';
+    }
+  }))} />;
+}
+
+function teacherSessionStatusLabel(status) {
+  return ({
+    SCHEDULED: 'Belum mulai',
+    OPEN: 'Sedang berjalan',
+    CLOSED: 'Sudah ditutup',
+    MISSED: 'Terlewat'
+  })[String(status)] || statusLabel(status);
+}
+
+function teacherSessionTone(status) {
+  return ({ SCHEDULED: 'warn', OPEN: 'ok', CLOSED: 'info', MISSED: 'bad' })[String(status)] || '';
+}
+
+function presensiPath(sessionId) {
+  return `/guru/presensi${qs({ sessionId })}`;
+}
+
+function sessionClassSubjectTitle(session) {
+  const text = (value) => typeof value === 'string' ? value.trim() : '';
+  const subjectName = text(session?.subject?.name) || text(session?.subjectName);
+  const classCode = text(session?.schoolClass?.code) || text(session?.schoolClass) || text(session?.className);
+  if (subjectName && classCode) return `${subjectName} · ${classCode}`;
+  return subjectName || classCode || 'Presensi Guru';
+}
+
+function TeacherTodaySessionCard({ item }) {
+  const rosterCountsKnown = Number.isFinite(item.studentTotal) && Number.isFinite(item.pendingCount);
+  const progressTotal = rosterCountsKnown ? Math.max(0, Number(item.studentTotal)) : null;
+  const filled = Math.max(0, Number(item.attendanceFilledCount || 0));
+  const pending = rosterCountsKnown ? Math.max(0, Number(item.pendingCount)) : null;
+  const rosterState = item.rosterState || item.rosterProvenance;
+  const warnings = [];
+  if (item.status === 'OPEN') warnings.push('Sesi ini belum ditutup.');
+  if (item.status === 'SCHEDULED') warnings.push('Presensi belum dimulai.');
+  if (item.status === 'MISSED') warnings.push('Sesi terlewat. Hubungi Admin/TU atau Guru Piket untuk pemulihan.');
+  if (pending !== null && pending > 0) warnings.push('Masih ada siswa yang belum diabsen.');
+  if (rosterState === 'BACKFILLED_UNVERIFIED') warnings.push('Roster hasil pemulihan/perbaikan; data historis tidak sepenuhnya terverifikasi.');
+
+  return <article className={`teacher-session-card ${teacherSessionTone(item.status)}`}>
+    <div className="teacher-session-main">
+      <div className="teacher-session-copy">
+        <div className="teacher-session-kicker"><Clock size={14} /> {item.startTime || '—'}–{item.endTime || '—'} <StatusPill status={item.status} /></div>
+        <h3>{item.className || 'Kelas'} · {item.subjectName || 'Mata pelajaran'}</h3>
+        <div className="teacher-session-meta"><span>{teacherSessionStatusLabel(item.status)}</span>{rosterCountsKnown ? <><span>{filled}/{progressTotal} siswa</span><span>{pending} belum diabsen</span></> : <span>Jumlah roster belum terverifikasi</span>}</div>
+        {rosterCountsKnown && <div className="teacher-session-progress"><RosterProgress current={filled} total={progressTotal} /></div>}
+        {warnings.length > 0 && <div className="teacher-session-warnings">{warnings.map((warning) => <span key={warning}>{warning}</span>)}</div>}
+      </div>
+      <div className="teacher-session-actions" aria-label={`Aksi ${item.className || 'kelas'}`}>
+        {item.actions?.canStart && <Btn variant="primary" onClick={() => go(presensiPath(item.sessionId))}><CheckSquare size={14} /> Mulai Presensi</Btn>}
+        {item.actions?.canContinue && <Btn variant="primary" onClick={() => go(presensiPath(item.sessionId))}><ArrowRight size={14} /> Lanjutkan Presensi</Btn>}
+        {item.actions?.canClose && <Btn onClick={() => go(presensiPath(item.sessionId))}><Check size={14} /> Tutup Sesi</Btn>}
+        {item.actions?.canViewRecap && <Btn onClick={() => go('/guru/rekap')}><BarChart3 size={14} /> Lihat Rekap</Btn>}
+      </div>
+    </div>
+  </article>;
+}
+
+export function TeacherDashboard() {
+  const todayState = useRemote(() => apiFetch('/teacher/today'), []);
+  const data = todayState.data || {};
+  const summary = data.summary || {};
+  const rows = itemsOf(data);
+  const hasUnclosed = Number(summary.unclosed || 0) > 0;
+
+  return <div className="content dashboard-redesign teacher-today-workspace"><PageHead eyebrow="GURU MAPEL" title="Kelas Saya Hari Ini" sub="Pantau jadwal mengajar dan selesaikan presensi kelas tanpa membuka banyak menu." actions={<Btn variant="primary" onClick={() => go('/guru/presensi')}><CheckSquare size={14} /> Mulai Presensi</Btn>} />
+    <RoleTaskPanel title="Aksi cepat guru" tasks={[{ title: 'Isi presensi', desc: 'Buka sesi hari ini dan selesaikan presensi siswa.', icon: <CheckSquare size={18} />, tone: 'ok', onClick: () => go('/guru/presensi') }, { title: 'Perbaiki presensi', desc: 'Koreksi data jika ada kesalahan dengan alasan.', icon: <Save size={18} />, onClick: () => go('/guru/koreksi') }, { title: 'Laporan kelas', desc: 'Lihat rekap kelas yang Anda ajar.', icon: <BarChart3 size={18} />, onClick: () => go('/guru/rekap') }]} />
+    {todayState.loading ? <LoadingState /> : todayState.error ? <ErrorState error={todayState.error} onRetry={todayState.refresh} /> : <>
+      {hasUnclosed && <div className="inline-note warn"><Clock size={14} /> Ada {summary.unclosed} sesi yang belum ditutup. Selesaikan dari tombol Lanjutkan Presensi atau Tutup Sesi.</div>}
+      {Number(summary.unknownRosterSessions || 0) > 0 && <div className="inline-note warn"><AlertTriangle size={14} /> Jumlah roster belum terverifikasi pada {summary.unknownRosterSessions} sesi.</div>}
+      {Number(summary.backfilledRosterSessions || 0) > 0 && <div className="inline-note warn"><AlertTriangle size={14} /> Roster hasil pemulihan/perbaikan; data historis tidak sepenuhnya terverifikasi.</div>}
+      <div className="grid g-4 teacher-today-kpis"><StatCardPremium icon={<Clock size={18} />} label="Sesi hari ini" value={summary.sessionsToday || 0} sub="Total jadwal mengajar" /><StatCardPremium icon={<Activity size={18} />} label="Sedang berjalan" value={summary.open || 0} sub="Sesi OPEN" tone={summary.open ? 'ok' : ''} /><StatCardPremium icon={<Users size={18} />} label="Belum ditutup" value={summary.unclosed || 0} sub={`${summary.studentsPendingAttendance || 0} siswa belum diabsen`} tone={summary.unclosed ? 'warn' : 'ok'} /><StatCardPremium icon={<CheckCircle2 size={18} />} label="Selesai" value={summary.closed || 0} sub="Sesi sudah ditutup" tone="info" /></div>
+      <Card title="Daftar jadwal/sesi hari ini" sub="Pilih aksi sesuai status sesi.">{rows.length ? <div className="teacher-session-list">{rows.map((item) => <TeacherTodaySessionCard key={item.sessionId} item={item} />)}</div> : <EmptyState title="Tidak ada jadwal mengajar hari ini." sub="Jadwal akan tampil otomatis sesuai data yang diatur admin." action={<Btn onClick={() => go('/guru/kehadiran-saya')}>Lihat Kehadiran Saya</Btn>} />}</Card>
+      <Card title="Status sesi" sub="Ringkasan sesi hari ini."><StackedBar segments={[{ label: 'Belum mulai', value: summary.scheduled || 0, tone: 'warn' }, { label: 'Sedang berjalan', value: summary.open || 0, tone: 'ok' }, { label: 'Sudah ditutup', value: summary.closed || 0, tone: 'info' }, { label: 'Terlewat', value: summary.missed || 0, tone: 'bad' }]} total={summary.sessionsToday || 0} /></Card>
+    </>}
+  </div>;
+}
+
+export function ClassInputPage({ notify }) {
+  const sessions = useRemote(() => apiFetch(`/attendance/class-sessions${qs({ date: today(), page: 1, limit: 50 })}`), []);
+  const [sessionId, setSessionId] = useState('');
+  const [earlyReason, setEarlyReason] = useState('');
+  const [nowTick, setNowTick] = useState(Date.now());
+  const [actionLoading, setActionLoading] = useState('');
+  const [geoStatus, setGeoStatus] = useState({ tone: 'info', message: 'Verifikasi lokasi dinonaktifkan sementara.' });
+  useEffect(() => {
+    const timer = setInterval(() => setNowTick(Date.now()), 30000);
+    return () => clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    if (!sessions.data) return;
+    const rows = itemsOf(sessions.data);
+    const requested = new URLSearchParams(window.location.search).get('sessionId') || '';
+    const first = rows.find((s) => s.status === 'OPEN') || rows.find((s) => s.status === 'SCHEDULED') || rows[0];
+    setSessionId((selected) => rows.some((s) => s.id === selected) ? selected : rows.some((s) => s.id === requested) ? requested : (first?.id || ''));
+  }, [sessions.data]);
+  const rosterState = useRemote(() => sessionId ? apiFetch(`/attendance/class-sessions/${sessionId}/roster`) : Promise.resolve({ roster: [] }), [sessionId]);
+  const journalState = useRemote(() => sessionId ? apiFetch(`/attendance/class-sessions/${sessionId}/journal`) : Promise.resolve(null), [sessionId]);
+  const [roster, setRoster] = useState([]);
+  const [journalForm, setJournalForm] = useState(EMPTY_JOURNAL);
+  const [journalDirty, setJournalDirty] = useState(false);
+  const [journalConflict, setJournalConflict] = useState(false);
+  useEffect(() => {
+    if (rosterState.data?.session?.id === sessionId && rosterState.data?.roster) {
+      setRoster(rosterState.data.roster.map((row) => ({ ...row, dirty: false, explicitlyConfirmed: false })));
+    }
+  }, [rosterState.data, sessionId]);
+  useEffect(() => {
+    if (!journalState.data || journalState.data.sessionId !== sessionId) return;
+    const journal = journalState.data.journal;
+    setJournalForm({ id: journal?.id || '', learningObjective: journal?.learningObjective || '', activity: journal?.activity || '', lessonHours: journal?.lessonHours ?? '', completionStatus: journal?.completionStatus || 'BELUM_TUNTAS', updatedAt: journal?.updatedAt || '' });
+    setJournalDirty(false);
+  }, [journalState.data, sessionId]);
+  useEffect(() => {
+    setRoster([]);
+    setJournalForm(EMPTY_JOURNAL);
+    setJournalDirty(false);
+    setJournalConflict(false);
+  }, [sessionId]);
+  const current = itemsOf(sessions.data).find((s) => s.id === sessionId);
+  const sessionDetail = rosterState.data?.session?.id === sessionId ? rosterState.data.session : current;
+  const teacherPresence = sessionDetail?.teacherPresence || current?.teacherPresence?.find?.((item) => item.teacherId === current?.teacher?.id) || null;
+  const presensiTitle = sessionClassSubjectTitle(sessionDetail);
+  const endsAt = sessionDetail?.endsAt ? new Date(sessionDetail.endsAt) : null;
+  const startsAt = sessionDetail?.startsAt ? new Date(sessionDetail.startsAt) : null;
+  const isEarlyCheckout = Boolean(endsAt && nowTick < endsAt.getTime());
+  const isOpen = (sessionDetail?.status || current?.status) === 'OPEN';
+  const counts = STATUS.reduce((acc, st) => ({ ...acc, [st]: roster.filter((r) => r.status === st).length }), {});
+  const completedCount = roster.filter((r) => (r.reviewState && r.reviewState !== 'DEFAULTED') || r.explicitlyConfirmed).length;
+  const defaultedCount = Math.max(0, roster.length - completedCount);
+  const presentLikeCount = counts.HADIR + counts.TELAT + counts.IZIN + counts.SAKIT;
+  const progressPercent = roster.length ? Math.round((completedCount / roster.length) * 100) : 0;
+  const hasDirtyAttendance = roster.some((row) => row.dirty || row.explicitlyConfirmed);
+  useEffect(() => {
+    const dirty = journalDirty || hasDirtyAttendance;
+    if (!dirty) { setNavigationGuard(null); return; }
+    const message = 'Perubahan presensi atau jurnal belum disimpan. Tinggalkan halaman?';
+    setNavigationGuard(() => window.confirm(message));
+    const beforeUnload = (event) => { event.preventDefault(); event.returnValue = ''; };
+    window.addEventListener('beforeunload', beforeUnload);
+    return () => {
+      setNavigationGuard(null);
+      window.removeEventListener('beforeunload', beforeUnload);
+    };
+  }, [journalDirty, hasDirtyAttendance]);
+  const journalValid = Boolean(journalForm.learningObjective.trim() && journalForm.activity.trim() && Number.isInteger(Number(journalForm.lessonHours)) && Number(journalForm.lessonHours) >= 1 && Number(journalForm.lessonHours) <= 24 && ['TUNTAS', 'BELUM_TUNTAS'].includes(journalForm.completionStatus));
+  const setJournalField = (key, value) => { setJournalForm((previous) => ({ ...previous, [key]: value })); setJournalDirty(true); };
+  const setStatus = (studentId, status) => setRoster((prev) => prev.map((r) => {
+    if (r.studentId !== studentId) return r;
+    return { ...r, status, dirty: true, explicitlyConfirmed: true };
+  }));
+  async function openSession() {
+    if (!sessionId) { notify('Pilih sesi terlebih dahulu.', 'warn'); return; }
+    setActionLoading('open');
+    setGeoStatus({ tone: 'info', message: 'Membuka sesi tanpa verifikasi lokasi...' });
+    try {
+      let result;
+      try {
+        result = await apiFetch(`/attendance/class-sessions/${sessionId}/open`, { method: 'POST', body: JSON.stringify({}) });
+      } catch (error) {
+        if (error?.code !== API_ERROR_CODES.SESSION_GEO_REQUIRED) throw error;
+        setGeoStatus({ tone: 'info', message: 'Verifikasi lokasi aktif. Meminta izin lokasi dari browser...' });
+        const location = await captureBrowserGeolocation();
+        result = await apiFetch(`/attendance/class-sessions/${sessionId}/open`, { method: 'POST', body: JSON.stringify(location) });
+      }
+      const geofence = result?.geofence;
+      setGeoStatus({
+        tone: 'ok',
+        message: geofence
+          ? `Di dalam area sekolah · jarak ${geofence.distanceMeter} m · radius ${geofence.radiusMeter} m · akurasi ±${geofence.accuracyMeter} m.`
+          : 'Verifikasi lokasi dinonaktifkan sementara.'
+      });
+      sessions.refresh(); rosterState.refresh(); notify('Absen masuk guru tercatat. Silakan isi presensi siswa awal pembelajaran.');
+    } catch (error) {
+      const details = error?.details;
+      const message = error instanceof BrowserGeoError
+        ? error.message
+        : error?.code === 'SESSION_OUTSIDE_GEOFENCE' && details
+          ? `Di luar area sekolah · jarak ${details.distanceMeter} m · radius ${details.radiusMeter} m · akurasi ±${details.accuracyMeter} m · batas toleransi ${details.allowedDistanceMeter} m.`
+          : (error.message || 'Gagal membuka sesi.');
+      setGeoStatus({ tone: 'bad', message });
+      notify(message, 'bad');
+    } finally { setActionLoading(''); }
+  }
+  async function persistAttendance(showSuccess = true) {
+    if (!sessionId || !roster.length) { notify('Pilih sesi dan pastikan daftar siswa sudah muncul.', 'warn'); return; }
+    const items = roster
+      .filter((r) => r.dirty || r.explicitlyConfirmed)
+      .map((r) => ({ studentId: r.studentId, status: r.status, note: r.note || undefined, updatedAt: r.updatedAt || undefined, confirm: true }));
+    const result = await apiFetch(`/attendance/class-sessions/${sessionId}/attendance`, { method: 'PUT', body: JSON.stringify({ items }) });
+    rosterState.refresh();
+    if (showSuccess) notify(result.message || 'Presensi siswa awal pembelajaran tersimpan.');
+    return result;
+  }
+  async function saveBatch() {
+    setActionLoading('save');
+    try {
+      await persistAttendance();
+    } catch (error) { notify(error.message || 'Gagal menyimpan presensi.', 'bad'); } finally { setActionLoading(''); }
+  }
+  async function bulkPresent() {
+    if (!sessionId || !roster.length) { notify('Pilih sesi dan pastikan daftar siswa sudah muncul.', 'warn'); return; }
+    setActionLoading('bulk-present');
+    try {
+      const result = await apiFetch(`/attendance/class-sessions/${sessionId}/attendance/bulk-present`, { method: 'POST' });
+      rosterState.refresh();
+      notify(result.message || 'Semua siswa default dikonfirmasi hadir.');
+    } catch (error) { notify(error.message || 'Gagal konfirmasi hadir massal.', 'bad'); } finally { setActionLoading(''); }
+  }
+  async function bulkAlpa() {
+    if (!sessionId || !roster.length) { notify('Pilih sesi dan pastikan daftar siswa sudah muncul.', 'warn'); return; }
+    if (!await riskConfirm('Semua siswa yang masih ALPA default akan dikonfirmasi ALPA. Status yang sudah dikonfirmasi tidak diubah.', 'Konfirmasi Alpa')) return;
+    setActionLoading('bulk-alpa');
+    try {
+      const result = await apiFetch(`/attendance/class-sessions/${sessionId}/attendance/bulk-alpa`, { method: 'POST' });
+      rosterState.refresh();
+      notify(result.message || 'ALPA default dikonfirmasi.');
+    } catch (error) { notify(error.message || 'Gagal konfirmasi ALPA.', 'bad'); } finally { setActionLoading(''); }
+  }
+  async function persistJournal(showSuccess = true) {
+    if (!sessionId || !isOpen || !journalValid) {
+      notify('Lengkapi tujuan pembelajaran, kegiatan, jumlah JP, dan status ketuntasan.', 'warn');
+      return null;
+    }
+    const payload = { learningObjective: journalForm.learningObjective.trim(), activity: journalForm.activity.trim(), lessonHours: Number(journalForm.lessonHours), completionStatus: journalForm.completionStatus, ...(journalForm.id ? { updatedAt: journalForm.updatedAt } : {}) };
+    let saved;
+    try {
+      saved = await apiFetch(`/attendance/class-sessions/${sessionId}/journal`, { method: 'PUT', body: JSON.stringify(payload) });
+    } catch (error) {
+      setJournalConflict(['SESSION_JOURNAL_VERSION_REQUIRED', 'SESSION_JOURNAL_STALE_VERSION'].includes(error.code));
+      throw error;
+    }
+    setJournalForm((previous) => ({ ...previous, ...saved, lessonHours: saved.lessonHours ?? previous.lessonHours }));
+    setJournalDirty(false);
+    setJournalConflict(false);
+    if (showSuccess) notify('Jurnal sesi tersimpan.');
+    return saved;
+  }
+  async function saveJournal() {
+    setActionLoading('journal');
+    try { await persistJournal(); }
+    catch (error) { notify(error.message || 'Gagal menyimpan jurnal.', 'bad'); }
+    finally { setActionLoading(''); }
+  }
+  async function closeSession() {
+    if (!sessionId || !roster.length) { notify('Pilih sesi dan isi presensi terlebih dahulu.', 'warn'); return; }
+    if (!journalValid) { notify('Lengkapi jurnal sesi sebelum menutup kelas.', 'warn'); return; }
+    if (isEarlyCheckout && earlyReason.trim().length < 10) { notify('Isi alasan keluar lebih awal minimal 10 karakter.', 'warn'); return; }
+    let finalizeDefaultAlpa = false;
+    if (progressPercent < 100) {
+      if (!await riskConfirm(`Masih ada ${defaultedCount} siswa ALPA default yang belum dikonfirmasi. Finalisasi sebagai ALPA dan akhiri kelas?`)) return;
+      finalizeDefaultAlpa = true;
+    } else if (!await riskConfirm('Absen keluar dan akhiri kelas? Pastikan presensi siswa awal pembelajaran sudah disimpan.')) return;
+    setActionLoading('close');
+    setGeoStatus({ tone: 'info', message: 'Menutup sesi tanpa verifikasi lokasi...' });
+    try {
+      if (hasDirtyAttendance) await persistAttendance(false);
+      if (journalDirty || !journalForm.id) await persistJournal(false);
+      await apiFetch(`/attendance/class-sessions/${sessionId}/close`, { method: 'POST', body: JSON.stringify({ finalizeDefaultAlpa, ...(isEarlyCheckout ? { earlyCheckoutReason: earlyReason } : {}) }) });
+      setGeoStatus({ tone: 'ok', message: 'Sesi ditutup tanpa verifikasi lokasi.' });
+      sessions.refresh(); rosterState.refresh(); notify('Absen keluar guru tercatat. Rekonsiliasi akan berjalan otomatis.');
+    } catch (error) {
+      const message = error instanceof BrowserGeoError ? error.message : (error.message || 'Gagal menutup sesi.');
+      setGeoStatus({ tone: 'bad', message });
+      notify(message, 'bad');
+    } finally { setActionLoading(''); }
+  }
+  async function selectSession(nextSessionId) {
+    if (nextSessionId === sessionId) return;
+    if ((journalDirty || hasDirtyAttendance) && !await riskConfirm('Perubahan presensi atau jurnal yang belum disimpan akan dibuang. Ganti sesi?')) return;
+    setSessionId(nextSessionId);
+  }
+  return <div className="content teacher-attendance-flow"><PageHead eyebrow="RUANG KERJA SESI" title={presensiTitle} sub="Masuk kelas, simpan presensi, lengkapi jurnal sesi, lalu tutup kelas." actions={<div className="session-picker-control"><Field label="Pilih sesi"><SelectInput wrapperClassName="session-picker-select" value={sessionId} onChange={(e) => { void selectSession(e.target.value); }} disabled={Boolean(actionLoading)}><option value="">Pilih sesi yang tersedia</option>{itemsOf(sessions.data).map((s) => <option key={s.id} value={s.id}>{sessionClassSubjectTitle(s)} · {statusLabel(s.status)}</option>)}</SelectInput></Field></div>} />
+    <StepGuide title="Urutan kerja guru" steps={['Pilih sesi yang benar.', 'Klik Masuk Kelas.', 'Isi dan simpan presensi siswa.', 'Lengkapi dan simpan jurnal sesi.', 'Tutup Sesi setelah semua data tersimpan.']} />
+    <div className="attendance-checkpoint"><div><span className="eyebrow">CHECKPOINT PRESENSI</span><b>{progressPercent}% selesai</b><small>{completedCount}/{roster.length || 0} siswa sudah dikonfirmasi. {defaultedCount ? `${defaultedCount} masih ALPA default.` : ''} {isOpen ? 'Sesi sedang bisa diisi.' : 'Buka sesi terlebih dahulu untuk mengubah status.'}</small></div><RosterProgress current={completedCount} total={roster.length} /></div>
+    <div className="grid g-4"><StatCardPremium icon={<Clock size={18} />} label="Jam Mulai" value={startsAt ? startsAt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jakarta' }) : '—'} sub={teacherPresence?.checkInAt ? `Masuk ${formatDateTime(teacherPresence.checkInAt)}` : 'Guru belum absen masuk'} /><StatCardPremium icon={<DoorOpen size={18} />} label="Jam Selesai" value={endsAt ? endsAt.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jakarta' }) : '—'} sub={teacherPresence?.checkOutAt ? `Keluar ${formatDateTime(teacherPresence.checkOutAt)}` : isEarlyCheckout ? 'Belum waktunya keluar' : 'Sudah boleh absen keluar'} tone={isEarlyCheckout ? 'warn' : 'ok'} /><StatCardPremium icon={<Activity size={18} />} label="Status Guru" value={teacherPresence?.status ? statusLabel(teacherPresence.status) : statusLabel(current?.status)} sub="Masuk/keluar kelas" /><StatCardPremium icon={<CheckCircle2 size={18} />} label="Siswa Tercatat" value={roster.length} sub={`${counts.HADIR || 0} hadir · ${counts.ALPA || 0} alpa`} /></div>
+    <Card title="Aksi guru" sub="Aksi presensi siswa dipisah dari absen keluar guru agar data awal pembelajaran tidak berubah tanpa sengaja.">
+      <div className={`inline-note ${geoStatus.tone}`} style={{ marginBottom: 12 }}><MapPin size={14} /> {geoStatus.message}</div>
+      {isOpen && roster.length > 0 && (
+        <div style={{ marginBottom: 16 }}>
+          <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
+            <span style={{ fontSize: 12, color: 'var(--fg-dim)', fontWeight: 600 }}>Kelengkapan presensi</span>
+            <span style={{ fontSize: 12, color: 'var(--accent)', fontWeight: 700, fontFamily: 'var(--font-mono)' }}>
+              {presentLikeCount} / {roster.length} siswa
+            </span>
+          </div>
+          <RosterProgress current={presentLikeCount} total={roster.length} />
+        </div>
+      )}<div className="row" style={{ gap: 8, flexWrap: 'wrap' }}><Btn variant="primary" loading={actionLoading === 'open'} onClick={openSession} disabled={!sessionId || isOpen || Boolean(actionLoading)}><Check size={14} /> Masuk Kelas</Btn><Btn loading={actionLoading === 'bulk-present'} onClick={bulkPresent} disabled={!isOpen || hasDirtyAttendance || Boolean(actionLoading)}><Users size={14} /> Semua Hadir</Btn><Btn variant="danger" loading={actionLoading === 'bulk-alpa'} onClick={bulkAlpa} disabled={!isOpen || hasDirtyAttendance || Boolean(actionLoading)}><X size={14} /> Tandai Alpa</Btn><Btn loading={actionLoading === 'save'} onClick={saveBatch} disabled={!roster.length || !isOpen || Boolean(actionLoading)}><Save size={14} /> Simpan Presensi</Btn></div>{isEarlyCheckout && isOpen && <Field label="Alasan keluar sebelum jam selesai" hint={`${earlyReason.trim().length}/10+`}><TextInput value={earlyReason} onChange={(e) => setEarlyReason(e.target.value)} placeholder="Wajib diisi jika kelas diakhiri sebelum jam selesai" /></Field>}</Card>
+    <Card title="Jurnal sesi" sub={isOpen ? 'Jurnal wajib tersimpan sebelum sesi ditutup.' : 'Jurnal sesi ditampilkan dalam mode baca saja.'}>
+      {journalState.error ? <ErrorState error={journalState.error} onRetry={journalState.refresh} /> : journalState.loading || journalState.data?.sessionId !== sessionId ? <LoadingState label="Memuat jurnal sesi…" /> : <div className="teacher-journal-form">
+        <Field label="Mata pelajaran"><TextInput value={[journalState.data?.subject?.code, journalState.data?.subject?.name].filter(Boolean).join(' · ')} readOnly /></Field>
+        <Field label="Tujuan pembelajaran"><TextInput type="textarea" rows={3} value={journalForm.learningObjective} onChange={(e) => setJournalField('learningObjective', e.target.value)} readOnly={!isOpen || Boolean(actionLoading)} placeholder="Tuliskan tujuan pembelajaran sesi ini" /></Field>
+        <Field label="Kegiatan"><TextInput type="textarea" rows={4} value={journalForm.activity} onChange={(e) => setJournalField('activity', e.target.value)} readOnly={!isOpen || Boolean(actionLoading)} placeholder="Ringkas kegiatan pembelajaran yang dilakukan" /></Field>
+        <div className="teacher-journal-meta"><Field label="Jumlah JP" hint={journalState.data?.scheduledDurationMinutes ? `Durasi jadwal ${journalState.data.scheduledDurationMinutes} menit` : undefined}><TextInput type="number" min="1" max="24" step="1" value={journalForm.lessonHours} onChange={(e) => setJournalField('lessonHours', e.target.value)} readOnly={!isOpen || Boolean(actionLoading)} /></Field><Field label="Status ketuntasan"><SelectInput value={journalForm.completionStatus} onChange={(e) => setJournalField('completionStatus', e.target.value)} disabled={!isOpen || Boolean(actionLoading)}><option value="TUNTAS">Tuntas</option><option value="BELUM_TUNTAS">Belum tuntas</option></SelectInput></Field></div>
+        {isOpen && <div className="teacher-journal-actions"><span aria-live="polite">{journalConflict ? 'Jurnal berubah di perangkat lain. Muat ulang untuk melanjutkan.' : journalDirty ? 'Perubahan jurnal belum disimpan.' : journalForm.id ? 'Jurnal sudah tersimpan.' : 'Jurnal belum disimpan.'}</span>{journalConflict && <Btn onClick={() => { setJournalConflict(false); journalState.refresh(); }} disabled={Boolean(actionLoading)}>Muat ulang jurnal</Btn>}<Btn loading={actionLoading === 'journal'} onClick={saveJournal} disabled={!journalValid || !journalDirty || journalConflict || Boolean(actionLoading)}><Save size={14} /> Simpan Jurnal</Btn><Btn variant="primary" loading={actionLoading === 'close'} onClick={closeSession} disabled={!roster.length || !journalValid || journalConflict || Boolean(actionLoading)}>Simpan & Tutup Sesi <ArrowRight size={14} /></Btn></div>}
+      </div>}
+    </Card>
+    <div className="grid g-2 chart-summary"><Card title="Presensi siswa" sub="Tandai semua Hadir, lalu ubah siswa yang Telat/Izin/Sakit/Alpa."><StatusDonut counts={counts} title="Status siswa" /></Card><Card title="Ringkasan sebelum Tutup Sesi" sub="Periksa ulang sebelum mengakhiri kelas."><StackedBar segments={STATUS.map((st) => ({ label: statusLabel(st), value: counts[st] || 0, tone: st === 'HADIR' ? 'ok' : st === 'ALPA' ? 'bad' : st === 'TELAT' ? 'warn' : 'info' }))} /></Card></div><div className="dock dock-sticky" aria-label="Ringkasan status presensi"><div className="dock-stats">{STATUS.map((st) => <span className="s" key={st}><span className="k">{statusLabel(st)}</span><span className="v">{counts[st] || 0}</span></span>)}</div>{isOpen && <Btn size="sm" variant="primary" loading={actionLoading === 'save'} onClick={saveBatch} disabled={!roster.length || Boolean(actionLoading)}><Save size={13} /> Simpan</Btn>}</div>{rosterState.loading ? <LoadingState /> : rosterState.error ? <ErrorState error={rosterState.error} /> : <div className="roster">{roster.map((s, i) => {
+      const warningLabels = scanWarningLabels(s.eligibility);
+      return <div key={s.studentId} className="roster-row"><div className="roster-idx">{String(i + 1).padStart(2, '0')}</div><Avatar name={s.fullName} /><div className="roster-student"><div className="roster-name">{s.fullName}</div><div className="roster-meta">{s.username} · kartu {statusLabel(s.cardStatus)} · {warningLabels.length ? 'Catatan scan perlu dipantau petugas' : 'Tidak ada catatan scan'}</div>{warningLabels.length > 0 && <div className="row-actions" aria-label="Catatan scan siswa">{warningLabels.map((label) => <Pill key={label} tone="warn">{label}</Pill>)}</div>}</div><div className="statuspick">{STATUS.map((st) => <button key={st} className={`${s.status === st ? 'on ' : ''}${st.toLowerCase()}`} disabled={!isOpen || Boolean(actionLoading)} onClick={() => setStatus(s.studentId, st)}>{statusLabel(st)}</button>)}</div></div>;
+    })}</div>}</div>;
+}
+
+export function CorrectionPage({ notify }) {
+  const [sessionId, setSessionId] = useState('');
+  const sessions = useRemote(() => apiFetch('/attendance/class-sessions?page=1&limit=100'), []);
+  const roster = useRemote(() => sessionId ? apiFetch(`/attendance/class-sessions/${sessionId}/roster`) : Promise.resolve({ roster: [] }), [sessionId]);
+  const [studentId, setStudentId] = useState('');
+  const [status, setStatus] = useState('SAKIT');
+  const [reason, setReason] = useState('Surat/keterangan diterima dan diverifikasi.');
+  const [saving, setSaving] = useState(false);
+  async function submit(e) { e.preventDefault(); setSaving(true); try { await apiFetch(`/attendance/class-sessions/${sessionId}/attendance/${studentId}`, { method: 'PATCH', body: JSON.stringify({ status, reason }) }); roster.refresh(); notify('Perbaikan tersimpan dan tercatat di riwayat perubahan.'); } catch (error) { notify(error.message || 'Gagal menyimpan koreksi.', 'bad'); } finally { setSaving(false); } }
+  return <div className="content"><PageHead eyebrow="PERBAIKI PRESENSI" title="Perbaiki Presensi" sub="Gunakan hanya jika ada data yang salah, dan tulis alasan dengan jelas." /><StepGuide title="Cara koreksi" steps={['Pilih sesi.', 'Pilih siswa.', 'Pilih status baru.', 'Tulis alasan.', 'Klik Simpan koreksi.']} /><Card><form className="form-grid" onSubmit={submit}><Field label="Sesi"><SelectInput value={sessionId} onChange={(e) => { setSessionId(e.target.value); setStudentId(''); }} required><option value="">Pilih sesi</option>{itemsOf(sessions.data).map((s) => <option key={s.id} value={s.id}>{s.schoolClass?.code} · {s.subject?.name} · {statusLabel(s.status)}</option>)}</SelectInput></Field><Field label="Siswa"><SelectInput value={studentId} onChange={(e) => setStudentId(e.target.value)} required><option value="">Pilih siswa</option>{itemsOf(roster.data).map((r) => <option key={r.studentId} value={r.studentId}>{r.fullName} · {statusLabel(r.status)}</option>)}</SelectInput></Field><Field label="Status Baru"><SelectInput value={status} onChange={(e) => setStatus(e.target.value)}>{STATUS.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}</SelectInput></Field><Field label="Alasan" hint={`${reason.trim().length}/10+`}><TextInput type="textarea" rows={4} value={reason} placeholder="Tulis alasan koreksi dengan jelas" onChange={(e) => setReason(e.target.value)} /></Field><Btn variant="primary" disabled={reason.trim().length < 10 || saving} loading={saving}>Simpan koreksi</Btn></form></Card></div>;
+}
+
+function leaveDuration(startDate, endDate) {
+  if (!startDate || !endDate || endDate < startDate) return 0;
+  return Math.floor((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86400000) + 1;
+}
+
+function leaveDate(value) {
+  return value ? new Date(`${value.slice(0, 10)}T00:00:00Z`).toLocaleDateString('id-ID', { dateStyle: 'medium', timeZone: 'Asia/Jakarta' }) : '—';
+}
+
+export function PersonnelLeavePage({ notify }) {
+  const leaves = useRemote(() => apiFetch('/teacher-leaves/me?page=1&limit=50'), []);
+  const [type, setType] = useState('IZIN');
+  const [startDate, setStartDate] = useState(today());
+  const [endDate, setEndDate] = useState(today());
+  const [reason, setReason] = useState('');
+  const [medicalLetter, setMedicalLetter] = useState(null);
+  const [medicinePhoto, setMedicinePhoto] = useState(null);
+  const [cancelReason, setCancelReason] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [cancellingId, setCancellingId] = useState('');
+  const [downloadingId, setDownloadingId] = useState('');
+  const [formError, setFormError] = useState('');
+  const duration = leaveDuration(startDate, endDate);
+  const sakitReady = type !== 'SAKIT' || (medicalLetter && medicinePhoto);
+  async function submit(e) {
+    e.preventDefault();
+    if (!duration || reason.trim().length < 10) {
+      setFormError(duration ? 'Alasan wajib diisi minimal 10 karakter.' : 'Tanggal selesai tidak boleh sebelum tanggal mulai.');
+      return;
+    }
+    if (type === 'SAKIT' && (!medicalLetter || !medicinePhoto)) {
+      setFormError('SAKIT wajib lampirkan foto surat dokter dan foto obat.');
+      return;
+    }
+    setSaving(true);
+    setFormError('');
+    try {
+      if (type === 'SAKIT') {
+        const body = new FormData();
+        body.set('type', type);
+        body.set('startDate', startDate);
+        body.set('endDate', endDate);
+        body.set('reason', reason.trim());
+        body.set('medicalLetter', medicalLetter);
+        body.set('medicinePhoto', medicinePhoto);
+        await apiFetch('/teacher-leaves', { method: 'POST', body });
+      } else {
+        await apiFetch('/teacher-leaves', { method: 'POST', body: JSON.stringify({ type, startDate, endDate, reason: reason.trim() }) });
+      }
+      setReason('');
+      setMedicalLetter(null);
+      setMedicinePhoto(null);
+      leaves.refresh();
+      notify('Pengajuan berhasil dikirim.');
+    } catch (error) {
+      const message = error.message || 'Gagal mengirim pengajuan.';
+      setFormError(message);
+      notify(message, 'bad');
+    } finally { setSaving(false); }
+  }
+  async function cancel(row) {
+    if (cancelReason.trim().length < 10) return;
+    setCancellingId(row.id);
+    setFormError('');
+    try {
+      await apiFetch(`/teacher-leaves/${row.id}/cancel`, { method: 'PATCH', body: JSON.stringify({ cancellationReason: cancelReason.trim() }) });
+      setCancelReason('');
+      leaves.refresh();
+      notify('Pengajuan dibatalkan.');
+    } catch (error) {
+      const message = error.message || 'Gagal membatalkan pengajuan.';
+      setFormError(message);
+      notify(message, 'bad');
+    } finally { setCancellingId(''); }
+  }
+  async function downloadLetter(row) {
+    setDownloadingId(row.id);
+    try {
+      await apiDownload(`/teacher-leaves/${row.id}/letter.pdf`, `surat-izin-${row.id}.pdf`);
+      notify('PDF siap. Print lalu TTD basah di Admin TU.');
+    } catch (error) {
+      notify(error.message || 'Gagal mengunduh surat.', 'bad');
+    } finally { setDownloadingId(''); }
+  }
+  function documentLabel(row) {
+    if (row.status !== 'APPROVED') return row.status === 'PENDING' ? 'PDF setelah disetujui' : '—';
+    if (row.documentStatus === 'SIGNED') return 'Sudah TTD basah';
+    if (row.type === 'SAKIT' && !row.visitEligible) return 'Cetak PDF · TTD basah setelah sembuh';
+    return 'Cetak PDF · TTD basah di TU';
+  }
+  return <div className="content"><PageHead eyebrow="IZIN PERSONEL" title="Izin, Sakit, dan Dinas Luar" sub="Setelah disetujui, tombol Cetak PDF TTD muncul di riwayat. Cetak offline, TTD basah pemohon + Admin TU di kertas." /><SimpleHelpBox title="Cara pakai surat formal" items={['Ajukan izin/sakit/dinas (SAKIT wajib foto surat dokter + obat).', 'Tunggu Admin TU menyetujui.', 'Klik Cetak PDF TTD di baris yang Disetujui, lalu print.', 'SAKIT: datang ke TU setelah tanggal selesai; IZIN/DINAS: bisa segera. TTD basah di kertas (offline).']} /><div className="grid g-2"><Card title="Buat pengajuan"><form className="form-grid" onSubmit={submit}><Field label="Jenis"><SelectInput value={type} onChange={(e) => setType(e.target.value)}><option value="IZIN">Izin</option><option value="SAKIT">Sakit</option><option value="DINAS_LUAR">Dinas luar</option></SelectInput></Field><div className="field-row"><Field label="Tanggal mulai"><TextInput type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} required /></Field><Field label="Tanggal selesai"><TextInput type="date" value={endDate} min={startDate} onChange={(e) => setEndDate(e.target.value)} required /></Field></div><div className={`inline-note ${duration ? 'info' : 'bad'}`} role="status">{duration ? `Durasi: ${duration} hari kalender.` : 'Tanggal selesai tidak boleh sebelum tanggal mulai.'}</div><Field label="Alasan" hint={`${reason.trim().length}/10+`}><TextInput type="textarea" rows={4} value={reason} placeholder="Jelaskan kebutuhan izin secara ringkas" onChange={(e) => setReason(e.target.value)} required /></Field>{type === 'SAKIT' ? <><Field label="Foto surat dokter"><input type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setMedicalLetter(e.target.files?.[0] || null)} required /></Field><Field label="Foto obat"><input type="file" accept="image/jpeg,image/png,image/webp" onChange={(e) => setMedicinePhoto(e.target.files?.[0] || null)} required /></Field></> : null}{formError && <div className="inline-note bad" role="alert">{formError}</div>}<Btn variant="primary" disabled={!duration || reason.trim().length < 10 || !sakitReady || saving} loading={saving}>Kirim pengajuan</Btn></form></Card><Card title="Riwayat pengajuan" sub="Isi alasan pembatalan sebelum membatalkan pengajuan yang menunggu. Surat formal hanya untuk yang disetujui."><Field label="Alasan pembatalan" hint={`${cancelReason.trim().length}/10+`}><TextInput type="textarea" rows={2} value={cancelReason} placeholder="Wajib diisi untuk membatalkan" onChange={(e) => setCancelReason(e.target.value)} /></Field>{leaves.loading ? <LoadingState /> : leaves.error ? <ErrorState error={leaves.error} onRetry={leaves.refresh} /> : itemsOf(leaves.data).length ? <DataTable rows={itemsOf(leaves.data)} columns={[{ header: 'Tanggal', render: (r) => `${leaveDate(r.startDate)} – ${leaveDate(r.endDate)}` }, { header: 'Durasi', render: (r) => `${leaveDuration(r.startDate?.slice(0, 10), r.endDate?.slice(0, 10))} hari` }, { header: 'Jenis', render: (r) => <StatusPill status={r.type} /> }, { header: 'Status', render: (r) => <StatusPill status={r.status} /> }, { header: 'Surat formal', render: (r) => <span style={{ fontSize: 12, color: 'var(--fg-muted)' }}>{documentLabel(r)}</span> }, { header: 'Alasan', render: (r) => <span style={{ fontSize: 12, color: 'var(--fg-muted)' }}>{r.reason || '—'}</span> }, { header: 'Catatan keputusan', render: (r) => <span style={{ fontSize: 12, color: 'var(--fg-muted)' }}>{r.decisionNote || '—'}</span> }]} onRow={(r) => <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>{r.status === 'APPROVED' ? <Btn size="sm" variant="primary" loading={downloadingId === r.id} disabled={Boolean(downloadingId)} onClick={() => downloadLetter(r)}><Download size={13} /> Cetak PDF TTD</Btn> : null}{r.status === 'PENDING' ? <Btn size="sm" variant="danger" loading={cancellingId === r.id} disabled={cancelReason.trim().length < 10 || Boolean(cancellingId)} onClick={() => cancel(r)}>Batalkan</Btn> : null}{r.hasMedicalLetter ? <Btn size="sm" variant="ghost" onClick={() => apiDownload(`/teacher-leaves/${r.id}/attachments/medical-letter`, `surat-dokter-${r.id}.jpg`).catch((error) => notify(error.message || 'Gagal membuka lampiran.', 'bad'))}>Surat dokter</Btn> : null}{r.hasMedicinePhoto ? <Btn size="sm" variant="ghost" onClick={() => apiDownload(`/teacher-leaves/${r.id}/attachments/medicine-photo`, `foto-obat-${r.id}.jpg`).catch((error) => notify(error.message || 'Gagal membuka lampiran.', 'bad'))}>Foto obat</Btn> : null}</div>} /> : <EmptyState title="Belum ada pengajuan" sub="Pengajuan yang sudah dikirim akan tampil di sini." />}</Card></div></div>;
+}
+
+export function TeacherRecapPage({ notify }) {
+  const [month, setMonth] = useState(monthNow());
+  const [format, setFormat] = useState('xlsx');
+  const [exporting, setExporting] = useState(false);
+  const [year, monthNumber] = month.split('-').map(Number);
+  const from = `${month}-01`;
+  const to = `${month}-${String(new Date(Date.UTC(year, monthNumber, 0)).getUTCDate()).padStart(2, '0')}`;
+  const recap = useRemote(() => apiFetch(`/reports/recap/classes${qs({ from, to, page: 1, limit: 100 })}`), [from, to]);
+  const rows = itemsOf(recap.data);
+  async function exportRecap() {
+    setExporting(true);
+    try { await apiDownload(`/reports/export${qs({ reportType: 'recap_classes', format, from, to })}`); }
+    catch (error) { notify?.(error.message || 'Laporan kelas belum bisa diunduh.', 'bad'); }
+    finally { setExporting(false); }
+  }
+  let content;
+  if (recap.loading) content = <LoadingState label="Memuat laporan kelas…" />;
+  else if (recap.error) content = <ErrorState error={recap.error} onRetry={recap.refresh} />;
+  else if (!rows.length) content = <EmptyState title="Belum ada rekap kelas" sub="Belum ada sesi kelas Anda pada bulan yang dipilih." />;
+  else content = <div className="grid g-2"><Card title="Kelengkapan sesi" sub="Persentase sesi yang sudah ditutup per kelas."><HorizontalBarList data={rows} labelKeys={['classCode', 'className']} valueKeys={['attendanceCoveragePercent']} maxValue={100} /></Card><Card title="Rekap per kelas" sub="Data hanya untuk kelas yang Anda ampu."><DataTable rows={rows} columns={[{ header: 'Kelas', render: (row) => `${row.classCode || '—'}${row.className && row.className !== row.classCode ? ` · ${row.className}` : ''}` }, { header: 'Sesi', key: 'sessionCount' }, { header: 'Selesai', key: 'closedSessions' }, { header: 'Kelengkapan', render: (row) => `${Number(row.attendanceCoveragePercent || 0).toLocaleString('id-ID')}%` }, { header: 'Hadir', render: (row) => row.counters?.HADIR ?? 0 }, { header: 'Alpa', render: (row) => row.counters?.ALPA ?? 0 }]} /></Card></div>;
+  return <div className="content"><PageHead eyebrow="LAPORAN GURU" title="Laporan Kelas Saya" sub="Ringkasan kelas yang Anda ajar pada bulan yang dipilih." actions={<><label className="input compact"><input type="month" value={month} onChange={(e) => setMonth(e.target.value)} aria-label="Pilih bulan" /></label><SelectInput aria-label="Format export kelas saya" value={format} onChange={(e) => setFormat(e.target.value)}><option value="csv">CSV</option><option value="xlsx">XLSX</option><option value="pdf">PDF</option><option value="docx">DOCX</option></SelectInput><Btn onClick={exportRecap} disabled={exporting}><Download size={14} /> {exporting ? 'Menyiapkan…' : 'Download'}</Btn></>} />{content}</div>;
+}

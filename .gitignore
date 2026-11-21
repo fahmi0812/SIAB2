@@ -1,0 +1,152 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+!.env.production.example
+!.env.production.supabase.example
+!.env.production.test.example
+!apps/web/.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.jks
+*credentials*.json
+akun_beta.txt
+.last_hardening_backup_path
+.last_deploy_artifact_path
+.env.local
+
+# Dependencies / build
+node_modules/
+dist/
+build/
+.next/
+.nuxt/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Coverage / test / browser reports
+coverage/
+.playwright/
+playwright-report/
+test-results/
+blob-report/
+apps/web/test-results/
+apps/web/playwright-report/
+apps/web/playwright-report-*/
+apps/web/blob-report/
+
+# Mutation testing
+.stryker-tmp/
+reports/mutation/
+mutation-report/
+
+# Local AI/security/test reports
+semgrep-results.json
+osv-results.json
+gitleaks-report.json
+gitleaks-dir-report.json
+repomix-output.*
+.knip-cache/
+
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS/editor
+.DS_Store
+
+# Android/local build outputs
+apps/android-reader/.gradle/
+apps/android-reader/local.properties
+apps/android-reader/keystore.properties
+apps/android-reader/**/build/
+apps/android-reader/**/*.apk
+apps/android-reader/**/*.aab
+apps/android-reader/output/
+tools/apk-builder/.venv/
+tools/apk-builder/**/__pycache__/
+tools/apk-builder/.pytest_cache/
+
+# Local data/backups
+postgres_data/
+redis_data/
+backups/
+uploads/
+apps/api/uploads/
+Data Akun/simpanakun/
+Data Akun/Akunlogin/
+Data Akun/Excel-data-mapel/
+de7/
+*.dump
+*.dump.enc
+*.sql.gz
+*.backup
+
+# Local/CI generated artifacts
+artifacts/
+apps/api/.prisma-generate/
+
+# SIAB2 video voice + HyperFrames outputs
+Voice/env
+Voice/output/
+Video/HyperFrames/output/
+Video/HyperFrames/evidence/
+*.local.env
+
+# Generated video media
+Video/HyperFrames/assets/audio/
+Video/HyperFrames/snapshots/
+
+# Private student/account data (never commit: credentials + personal data)
+Data Akun/simpanakun.zip
+Data Akun/.simpanakun-backup-*/
+Data Akun/.simpanakun-backup-*.zip
+Data Akun/akun.txt
+Data Akun/*.xlsx
+Data Akun/*.xls
+Data Akun/*.pdf
+Data Akun/*.jpeg
+DataSekolah/*.xlsx
+DataSekolah/*.xls
+DataSekolah/*.pdf
+
+# Local tooling caches / scratch output (not source)
+.codebase-memory/
+.serena/
+.playwright-cli/
+.pi/memory/
+.tmp/
+audit-full/
+
+# Personal/credential exports and local run state (never commit)
+DataSekolah/*.csv
+Data Akun/*.csv
+.claude/settings.local.json
+.claude/worktrees/
+outputs/
+runtime/
+
+# Local AI agent files and internal notes (not part of the public repo)
+CLAUDE.md
+AGENTS.md
+**/AGENTS.md
+.pi/
+Laporan/
+prd*.md
+/.xlsx
+/IMPLEMENTATION_PLAN.md
+/IMPLEMENTATION-GAP-REPORT.md
+/PIXEL-PERFECT-PORT-MAP.md
+/PIXEL-PERFECT-SOURCE-OF-TRUTH.md
+/SIAB2_REDESIGN_RESET_STATUS.md
+/AUDIT.md
+/LATEST_AUDIT.md
