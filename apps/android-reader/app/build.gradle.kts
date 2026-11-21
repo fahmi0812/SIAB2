@@ -97,7 +97,7 @@ dependencies {
     ksp("androidx.room:room-compiler:2.6.1")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
-    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("com.squareup.okhttp3:mockwebserver:5.5.1")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.4")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }
