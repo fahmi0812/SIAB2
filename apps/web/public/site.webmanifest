@@ -1,0 +1,17 @@
+{
+  "name": "SIAB2",
+  "short_name": "SIAB2",
+  "description": "SIAB2 — Sistem Informasi Akademik Berkarakter MAN 1 Rokan Hulu",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07111F",
+  "theme_color": "#0EA5E9",
+  "icons": [
+    {
+      "src": "/app-icon.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
